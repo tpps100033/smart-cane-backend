@@ -9,7 +9,15 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 APP_NAME = "cane-fall-backend"
-DB_PATH = os.getenv("DB_PATH", "/data/cane.db")
+DB_PATH = os.getenv("DB_PATH", "/tmp/cane.db")
+
+# 印出目前 DB_PATH（用來確認 Railway 變數到底有沒有生效）
+print("DB_PATH =", DB_PATH, flush=True)
+
+# 確保資料夾存在（避免 /data 沒掛 volume 直接爆炸）
+db_dir = os.path.dirname(DB_PATH)
+if db_dir:
+    os.makedirs(db_dir, exist_ok=True)
 
 # Telegram (optional but recommended)
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
