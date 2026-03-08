@@ -2,31 +2,29 @@ import os
 import uuid
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 APP_NAME = "cane-fall-backend"
+
 DB_PATH = os.getenv("DB_PATH", "/data/cane.db")
-
-print("DB_PATH =", DB_PATH, flush=True)
-
-db_dir = os.path.dirname(DB_PATH)
-if db_dir:
-    os.makedirs(db_dir, exist_ok=True)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+
 ADMIN_TELEGRAM_IDS = os.getenv("ADMIN_TELEGRAM_IDS", "")
 ADMIN_TELEGRAM_IDS = [x.strip() for x in ADMIN_TELEGRAM_IDS.split(",") if x.strip()]
 
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
-# ======================
-# DB helpers
-# ======================
+app = FastAPI(title=APP_NAME)
+
+# ----------------------
+# UTILS
+# ----------------------
 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -36,34 +34,34 @@ def db_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
-# ======================
-# DB init
-# ======================
+# ----------------------
+# DB INIT
+# ----------------------
 
 def init_db():
     conn = db_conn()
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS devices (
+    CREATE TABLE IF NOT EXISTS devices(
       device_id TEXT PRIMARY KEY,
-      api_key TEXT NOT NULL,
+      api_key TEXT,
       alias TEXT,
-      created_at TEXT NOT NULL,
+      created_at TEXT,
       last_seen_at TEXT,
       last_battery_v REAL,
       last_rssi INTEGER,
       firmware TEXT,
-      is_active INTEGER NOT NULL DEFAULT 1
-    );
+      is_active INTEGER DEFAULT 1
+    )
     """)
 
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS events (
+    CREATE TABLE IF NOT EXISTS events(
       event_id TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL,
-      device_id TEXT NOT NULL,
+      created_at TEXT,
+      device_id TEXT,
       device_ts TEXT,
-      level TEXT NOT NULL,
+      level TEXT,
       fsr INTEGER,
       acc_peak REAL,
       variance REAL,
@@ -71,26 +69,11 @@ def init_db():
       firmware TEXT,
       battery_v REAL,
       rssi INTEGER,
-      ack_local INTEGER NOT NULL DEFAULT 0,
-      notify_status TEXT NOT NULL,
+      ack_local INTEGER,
+      notify_status TEXT,
       notify_error TEXT
-    );
+    )
     """)
-
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS notify_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      event_id TEXT NOT NULL,
-      channel TEXT NOT NULL,
-      attempt INTEGER NOT NULL,
-      status_code INTEGER,
-      ok INTEGER NOT NULL,
-      error TEXT,
-      created_at TEXT NOT NULL
-    );
-    """)
-
-    # ===== 新增多用戶 =====
 
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users(
@@ -107,60 +90,32 @@ def init_db():
       telegram_id TEXT,
       device_id TEXT,
       created_at TEXT,
-      PRIMARY KEY (telegram_id,device_id)
+      PRIMARY KEY (telegram_id, device_id)
     )
     """)
 
     conn.commit()
     conn.close()
 
-# ======================
-# auth
-# ======================
+@app.on_event("startup")
+def startup():
+    init_db()
 
-def require_admin(x_admin_key: str):
-    if not ADMIN_KEY or x_admin_key != ADMIN_KEY:
-        raise HTTPException(status_code=403, detail="invalid_admin_key")
-
-def auth_device(conn, device_id, x_api_key):
-    row = conn.execute(
-        "SELECT * FROM devices WHERE device_id=? AND is_active=1",
-        (device_id,)
-    ).fetchone()
-
-    if row is None:
-        raise HTTPException(status_code=404)
-
-    if row["api_key"] != x_api_key:
-        raise HTTPException(status_code=403)
-
-    return row
-
-# ======================
-# telegram
-# ======================
+# ----------------------
+# TELEGRAM
+# ----------------------
 
 def tg_send(chat_id, text):
 
     if not TG_BOT_TOKEN:
-        return {"ok": False}
+        return
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
-    try:
-
-        r = requests.post(url, json={
-            "chat_id": chat_id,
-            "text": text
-        }, timeout=8)
-
-        ok = r.status_code == 200 and r.json().get("ok")
-
-        return {"ok": ok}
-
-    except Exception as e:
-
-        return {"ok": False, "error": str(e)}
+    requests.post(url, json={
+        "chat_id": chat_id,
+        "text": text
+    })
 
 def get_notify_targets(conn, device_id):
 
@@ -182,52 +137,61 @@ def get_notify_targets(conn, device_id):
 
     return list(targets)
 
-def notify_event(conn, event_row, attempts=3):
+# ----------------------
+# 通知
+# ----------------------
+
+def notify_event(conn, event_row):
 
     device_id = event_row["device_id"]
     level = event_row["level"]
 
-    msg = f"""
-跌倒警示 {level}
+    if level == "YELLOW":
+        emoji = "🟡"
+        status = "已恢復站立"
 
-device: {device_id}
-time: {event_row['created_at']}
-"""
+    elif level == "ORANGE":
+        emoji = "🟠"
+        status = "掙扎中"
+
+    elif level == "RED":
+        emoji = "🔴"
+        status = "可能無法起身"
+
+    else:
+        emoji = "⚪"
+        status = "未知"
+
+    device = conn.execute(
+        "SELECT alias FROM devices WHERE device_id=?",
+        (device_id,)
+    ).fetchone()
+
+    alias = device["alias"] if device and device["alias"] else device_id
+
+    msg = (
+        f"{emoji} 跌倒警示 {level}\n\n"
+        f"狀態: {status}\n"
+        f"設備: {alias} ({device_id})\n"
+        f"time: {event_row['created_at']}\n"
+        f"battery: {event_row['battery_v']}\n"
+        f"rssi: {event_row['rssi']}\n"
+        f"note: {event_row['note']}"
+    )
 
     targets = get_notify_targets(conn, device_id)
 
-    last = {"ok": False}
-
     for chat_id in targets:
+        tg_send(chat_id, msg)
 
-        last = tg_send(chat_id, msg)
-
-    return last
-
-# ======================
-# models
-# ======================
+# ----------------------
+# MODELS
+# ----------------------
 
 class DeviceCreate(BaseModel):
     device_id: str
     api_key: str
-    alias: Optional[str] = None
-
-class DeviceOut(BaseModel):
-    device_id: str
     alias: Optional[str]
-    created_at: str
-    last_seen_at: Optional[str]
-    last_battery_v: Optional[float]
-    last_rssi: Optional[int]
-    firmware: Optional[str]
-    is_active: bool
-
-class HeartbeatIn(BaseModel):
-    device_id: str
-    battery_v: Optional[float]
-    rssi: Optional[int]
-    firmware: Optional[str]
 
 class EventIn(BaseModel):
     device_id: str
@@ -236,65 +200,42 @@ class EventIn(BaseModel):
     battery_v: Optional[float] = None
     rssi: Optional[int] = None
 
-class EventOut(BaseModel):
-    event_id: str
-    created_at: str
-    device_id: str
-    level: str
-    notify_status: str
-    notify_error: Optional[str]
+# ----------------------
+# ADMIN API
+# ----------------------
 
-# ======================
-# app
-# ======================
+@app.post("/admin/devices")
+def create_device(payload: DeviceCreate, x_admin_key: str = Header(default="")):
 
-app = FastAPI(title=APP_NAME)
-
-@app.on_event("startup")
-def startup():
-    init_db()
-
-@app.get("/healthz")
-def healthz():
-    return {"ok": True}
-
-@app.get("/")
-def home():
-    return {"service": APP_NAME}
-
-# ======================
-# admin API
-# ======================
-
-@app.post("/admin/devices", response_model=DeviceOut)
-def admin_create_device(payload: DeviceCreate, x_admin_key: str = Header(default="")):
-
-    require_admin(x_admin_key)
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=403)
 
     conn = db_conn()
 
-    created_at = utc_now_iso()
-
     conn.execute(
-        "INSERT OR REPLACE INTO devices(device_id, api_key, alias, created_at, is_active) VALUES(?,?,?,?,1)",
-        (payload.device_id, payload.api_key, payload.alias, created_at)
+        "INSERT INTO devices VALUES(?,?,?,?,?,?,?, ?,1)",
+        (
+            payload.device_id,
+            payload.api_key,
+            payload.alias,
+            utc_now_iso(),
+            None,
+            None,
+            None,
+            None
+        )
     )
 
     conn.commit()
-
-    row = conn.execute(
-        "SELECT * FROM devices WHERE device_id=?",
-        (payload.device_id,)
-    ).fetchone()
-
     conn.close()
 
-    return row
+    return {"device_id": payload.device_id}
 
-@app.get("/admin/devices", response_model=List[DeviceOut])
-def admin_list_devices(x_admin_key: str = Header(default="")):
+@app.get("/admin/devices")
+def list_devices(x_admin_key: str = Header(default="")):
 
-    require_admin(x_admin_key)
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=403)
 
     conn = db_conn()
 
@@ -304,30 +245,13 @@ def admin_list_devices(x_admin_key: str = Header(default="")):
 
     conn.close()
 
-    return rows
+    return [dict(r) for r in rows]
 
-@app.post("/admin/devices/{device_id}/deactivate")
-def admin_deactivate_device(device_id: str, x_admin_key: str = Header(default="")):
+@app.get("/admin/events")
+def list_events(x_admin_key: str = Header(default="")):
 
-    require_admin(x_admin_key)
-
-    conn = db_conn()
-
-    conn.execute(
-        "UPDATE devices SET is_active=0 WHERE device_id=?",
-        (device_id,)
-    )
-
-    conn.commit()
-
-    conn.close()
-
-    return {"ok": True}
-
-@app.get("/admin/events", response_model=List[EventOut])
-def admin_list_events(x_admin_key: str = Header(default="")):
-
-    require_admin(x_admin_key)
+    if x_admin_key != ADMIN_KEY:
+        raise HTTPException(status_code=403)
 
     conn = db_conn()
 
@@ -337,96 +261,67 @@ def admin_list_events(x_admin_key: str = Header(default="")):
 
     conn.close()
 
-    return rows
+    return [dict(r) for r in rows]
 
-# ======================
-# device API
-# ======================
+# ----------------------
+# DEVICE API
+# ----------------------
 
-@app.post("/api/v1/heartbeat")
-def heartbeat(payload: HeartbeatIn, x_api_key: str = Header(default="")):
-
-    conn = db_conn()
-
-    auth_device(conn, payload.device_id, x_api_key)
-
-    conn.execute(
-        "UPDATE devices SET last_seen_at=? WHERE device_id=?",
-        (utc_now_iso(), payload.device_id)
-    )
-
-    conn.commit()
-
-    conn.close()
-
-    return {"ok": True}
-
-@app.post("/api/v1/events", response_model=EventOut)
+@app.post("/api/v1/events")
 def create_event(payload: EventIn, x_api_key: str = Header(default="")):
 
     conn = db_conn()
 
-    auth_device(conn, payload.device_id, x_api_key)
+    device = conn.execute(
+        "SELECT * FROM devices WHERE device_id=?",
+        (payload.device_id,)
+    ).fetchone()
+
+    if not device:
+        raise HTTPException(status_code=404)
+
+    if device["api_key"] != x_api_key:
+        raise HTTPException(status_code=403)
 
     event_id = str(uuid.uuid4())
 
-    created_at = utc_now_iso()
-
     conn.execute(
-        """INSERT INTO events
-        (event_id, created_at, device_id, level, note, battery_v, rssi, notify_status)
-        VALUES (?,?,?,?,?,?,?,?)""",
+        """INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             event_id,
-            created_at,
+            utc_now_iso(),
             payload.device_id,
+            None,
             payload.level,
+            None,
+            None,
+            None,
             payload.note,
+            None,
             payload.battery_v,
             payload.rssi,
-            "PENDING"
+            0,
+            "PENDING",
+            None
         )
     )
 
     conn.commit()
 
-    row = conn.execute(
+    event = conn.execute(
         "SELECT * FROM events WHERE event_id=?",
         (event_id,)
     ).fetchone()
 
-    result = notify_event(conn, row)
+    notify_event(conn, event)
 
-    if result["ok"]:
-
-        notify_status = "SENT"
-        notify_error = None
-
-    else:
-
-        notify_status = "FAILED"
-        notify_error = "telegram_error"
-
-    conn.execute(
-        "UPDATE events SET notify_status=?, notify_error=? WHERE event_id=?",
-        (notify_status, notify_error, event_id)
-    )
-
-    conn.commit()
     conn.close()
 
-    return EventOut(
-        event_id=event_id,
-        created_at=created_at,
-        device_id=payload.device_id,
-        level=payload.level,
-        notify_status=notify_status,
-        notify_error=notify_error
-    )
+    return {"event_id": event_id}
 
-# ======================
-# telegram bot
-# ======================
+# ----------------------
+# TELEGRAM BOT
+# ----------------------
 
 @app.post("/tg/webhook")
 def telegram_webhook(update: dict):
@@ -437,7 +332,7 @@ def telegram_webhook(update: dict):
     msg = update["message"]
 
     chat_id = str(msg["chat"]["id"])
-    text = msg.get("text", "")
+    text = msg.get("text", "").strip()
 
     conn = db_conn()
 
@@ -463,6 +358,15 @@ def telegram_webhook(update: dict):
         ).fetchone()
 
     if text == "/start":
+
+        tg_send(chat_id,
+        "智能拐杖系統\n\n"
+        "/pair 配對拐杖\n"
+        "/mydevices 查看我的拐杖\n"
+        "/unbind cane-001 解除配對"
+        )
+
+    elif text == "/pair":
 
         tg_send(chat_id, "請輸入拐杖序號 (例如 cane-001)")
 
