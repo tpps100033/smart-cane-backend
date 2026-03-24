@@ -30,8 +30,8 @@ ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 465
 # 請將以下兩行修改為您的實際測試信箱
-SENDER_EMAIL = "您的發信郵箱@gmail.com"
-DEMO_RECEIVER_EMAIL = "演示接收用郵箱@example.com"
+SENDER_EMAIL = "smartcanebackend@gmail.com"
+DEMO_RECEIVER_EMAIL = "tpps100033@gmail.com"
 # 您的專屬密碼已填入
 SENDER_PASSWORD = "auqdikpsikfnhekw"
 
