@@ -3,9 +3,13 @@ import uuid
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional, List
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
 
 import requests
-from fastapi import FastAPI, Header, HTTPException
+# [新增 Email 功能] 匯入了 BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 
 APP_NAME = "cane-fall-backend"
@@ -19,6 +23,45 @@ ADMIN_TELEGRAM_IDS = os.getenv("ADMIN_TELEGRAM_IDS", "")
 ADMIN_TELEGRAM_IDS = [x.strip() for x in ADMIN_TELEGRAM_IDS.split(",") if x.strip()]
 
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+# ----------------------
+# [新增 Email 功能] EMAIL 設定
+# ----------------------
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 465
+# 請將以下兩行修改為您的實際測試信箱
+SENDER_EMAIL = "您的發信郵箱@gmail.com"
+DEMO_RECEIVER_EMAIL = "演示接收用郵箱@example.com"
+# 您的專屬密碼已填入
+SENDER_PASSWORD = "auqdikpsikfnhekw"
+
+def send_demo_email_task(level: str, note: str, device_id: str):
+    """背景執行：依照 PRD 發送緊急通報郵件"""
+    now = datetime.now(timezone.utc).isoformat()
+    subject = f"🚨 智能拐杖警報：{level} (技術演示)"
+    
+    body = f"""
+    --- Smart-Cane 智能拐杖即時通報 ---
+    發送時間 (UTC)：{now}
+    設備編號：{device_id}
+    警報等級：{level}
+    狀況描述：{note}
+    ----------------------------------
+    此郵件由 Smart-Cane 系統自動發送，用於技術驗證。
+    """
+
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = DEMO_RECEIVER_EMAIL
+    msg['Subject'] = Header(subject, 'utf-8')
+
+    try:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, DEMO_RECEIVER_EMAIL, msg.as_string())
+        print(f"✅ Email 成功發送至 {DEMO_RECEIVER_EMAIL}")
+    except Exception as e:
+        print(f"❌ Email 發送失敗: {e}")
 
 app = FastAPI(title=APP_NAME)
 
@@ -268,7 +311,8 @@ def list_events(x_admin_key: str = Header(default="")):
 # ----------------------
 
 @app.post("/api/v1/events")
-def create_event(payload: EventIn, x_api_key: str = Header(default="")):
+# [新增 Email 功能] 新增了 background_tasks 參數
+def create_event(payload: EventIn, background_tasks: BackgroundTasks, x_api_key: str = Header(default="")):
 
     conn = db_conn()
 
@@ -313,7 +357,12 @@ def create_event(payload: EventIn, x_api_key: str = Header(default="")):
         (event_id,)
     ).fetchone()
 
+    # 原本的 Telegram 通知 (不變)
     notify_event(conn, event)
+
+    # [新增 Email 功能] 針對嚴重等級，將發信任務加入背景排程
+    if payload.level in ["RED", "ORANGE"]:
+        background_tasks.add_task(send_demo_email_task, payload.level, payload.note, payload.device_id)
 
     conn.close()
 
