@@ -3,6 +3,9 @@ import uuid
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional, List
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header as EmailHeader
 
 import requests
 from fastapi import FastAPI, Header, HTTPException
@@ -19,6 +22,47 @@ ADMIN_TELEGRAM_IDS = os.getenv("ADMIN_TELEGRAM_IDS", "")
 ADMIN_TELEGRAM_IDS = [x.strip() for x in ADMIN_TELEGRAM_IDS.split(",") if x.strip()]
 
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
+
+# ----------------------
+# [新增 Email 功能] EMAIL 設定
+# ----------------------
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587  # <--- [已修改] 換成 587 埠口，繞過 Railway 網路阻擋
+SENDER_EMAIL = "smartcanebackend@gmail.com"
+DEMO_RECEIVER_EMAIL = "tpps100033@gmail.com"
+SENDER_PASSWORD = "auqdikpsikfnhekw"
+
+def send_demo_email(level: str, note: str, device_id: str):
+    """直接執行：依照 PRD 發送緊急通報郵件"""
+    now = datetime.now(timezone.utc).isoformat()
+    subject = f"🚨 智能拐杖警報：{level} (技術演示)"
+    
+    body = f"""
+    --- Smart-Cane 智能拐杖即時通報 ---
+    發送時間 (UTC)：{now}
+    設備編號：{device_id}
+    警報等級：{level}
+    狀況描述：{note}
+    ----------------------------------
+    此郵件由 Smart-Cane 系統自動發送，用於技術驗證。
+    """
+
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = DEMO_RECEIVER_EMAIL
+    msg['Subject'] = EmailHeader(subject, 'utf-8')
+
+    try:
+        print(f"⏳ 準備透過 Port {SMTP_PORT} 發送 Email 給 {DEMO_RECEIVER_EMAIL}...", flush=True)
+        # [已修改] 使用標準 SMTP，並透過 STARTTLS 升級為安全連線
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()  # 啟動 TLS 加密
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, DEMO_RECEIVER_EMAIL, msg.as_string())
+        print(f"✅ Email 成功發送至 {DEMO_RECEIVER_EMAIL}", flush=True)
+    except Exception as e:
+        print(f"❌ Email 發送失敗: {e}", flush=True)
 
 app = FastAPI(title=APP_NAME)
 
@@ -313,7 +357,13 @@ def create_event(payload: EventIn, x_api_key: str = Header(default="")):
         (event_id,)
     ).fetchone()
 
+    # 原本的 Telegram 通知
     notify_event(conn, event)
+
+    # [新增 Email 功能] 針對嚴重等級觸發通報，並印出 Log 方便除錯
+    print(f"🔍 檢查到的 Level 為: {payload.level}", flush=True)
+    if payload.level in ["RED", "ORANGE"]:
+        send_demo_email(payload.level, payload.note, payload.device_id)
 
     conn.close()
 
