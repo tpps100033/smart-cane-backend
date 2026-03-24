@@ -27,7 +27,7 @@ ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 # [新增 Email 功能] EMAIL 設定
 # ----------------------
 SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 465
+SMTP_PORT = 587  # <--- [已修改] 換成 587 埠口，繞過 Railway 網路阻擋
 SENDER_EMAIL = "smartcanebackend@gmail.com"
 DEMO_RECEIVER_EMAIL = "tpps100033@gmail.com"
 SENDER_PASSWORD = "auqdikpsikfnhekw"
@@ -53,9 +53,11 @@ def send_demo_email(level: str, note: str, device_id: str):
     msg['Subject'] = EmailHeader(subject, 'utf-8')
 
     try:
-        # 強制印出開始發信的 log
-        print(f"⏳ 準備發送 Email 給 {DEMO_RECEIVER_EMAIL}...", flush=True)
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as server:
+        print(f"⏳ 準備透過 Port {SMTP_PORT} 發送 Email 給 {DEMO_RECEIVER_EMAIL}...", flush=True)
+        # [已修改] 使用標準 SMTP，並透過 STARTTLS 升級為安全連線
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()  # 啟動 TLS 加密
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, DEMO_RECEIVER_EMAIL, msg.as_string())
         print(f"✅ Email 成功發送至 {DEMO_RECEIVER_EMAIL}", flush=True)
@@ -65,7 +67,7 @@ def send_demo_email(level: str, note: str, device_id: str):
 app = FastAPI(title=APP_NAME)
 
 # ----------------------
-# UTILS & DB INIT (保持不變)
+# UTILS
 # ----------------------
 
 def utc_now_iso():
@@ -76,12 +78,66 @@ def db_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+# ----------------------
+# DB INIT
+# ----------------------
+
 def init_db():
     conn = db_conn()
-    conn.execute("CREATE TABLE IF NOT EXISTS devices(device_id TEXT PRIMARY KEY, api_key TEXT, alias TEXT, created_at TEXT, last_seen_at TEXT, last_battery_v REAL, last_rssi INTEGER, firmware TEXT, is_active INTEGER DEFAULT 1)")
-    conn.execute("CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY, created_at TEXT, device_id TEXT, device_ts TEXT, level TEXT, fsr INTEGER, acc_peak REAL, variance REAL, note TEXT, firmware TEXT, battery_v REAL, rssi INTEGER, ack_local INTEGER, notify_status TEXT, notify_error TEXT)")
-    conn.execute("CREATE TABLE IF NOT EXISTS users(telegram_id TEXT PRIMARY KEY, username TEXT, role TEXT, state TEXT, created_at TEXT)")
-    conn.execute("CREATE TABLE IF NOT EXISTS user_devices(telegram_id TEXT, device_id TEXT, created_at TEXT, PRIMARY KEY (telegram_id, device_id))")
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS devices(
+      device_id TEXT PRIMARY KEY,
+      api_key TEXT,
+      alias TEXT,
+      created_at TEXT,
+      last_seen_at TEXT,
+      last_battery_v REAL,
+      last_rssi INTEGER,
+      firmware TEXT,
+      is_active INTEGER DEFAULT 1
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS events(
+      event_id TEXT PRIMARY KEY,
+      created_at TEXT,
+      device_id TEXT,
+      device_ts TEXT,
+      level TEXT,
+      fsr INTEGER,
+      acc_peak REAL,
+      variance REAL,
+      note TEXT,
+      firmware TEXT,
+      battery_v REAL,
+      rssi INTEGER,
+      ack_local INTEGER,
+      notify_status TEXT,
+      notify_error TEXT
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+      telegram_id TEXT PRIMARY KEY,
+      username TEXT,
+      role TEXT,
+      state TEXT,
+      created_at TEXT
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_devices(
+      telegram_id TEXT,
+      device_id TEXT,
+      created_at TEXT,
+      PRIMARY KEY (telegram_id, device_id)
+    )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -90,47 +146,90 @@ def startup():
     init_db()
 
 # ----------------------
-# TELEGRAM (保持不變)
+# TELEGRAM
 # ----------------------
 
 def tg_send(chat_id, text):
+
     if not TG_BOT_TOKEN:
         return
+
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text})
+
+    requests.post(url, json={
+        "chat_id": chat_id,
+        "text": text
+    })
 
 def get_notify_targets(conn, device_id):
+
     targets = set()
+
     if TG_CHAT_ID:
         targets.add(TG_CHAT_ID)
+
     for admin in ADMIN_TELEGRAM_IDS:
         targets.add(admin)
-    rows = conn.execute("SELECT telegram_id FROM user_devices WHERE device_id=?", (device_id,)).fetchall()
+
+    rows = conn.execute(
+        "SELECT telegram_id FROM user_devices WHERE device_id=?",
+        (device_id,)
+    ).fetchall()
+
     for r in rows:
         targets.add(r["telegram_id"])
+
     return list(targets)
 
+# ----------------------
+# 通知
+# ----------------------
+
 def notify_event(conn, event_row):
+
     device_id = event_row["device_id"]
     level = event_row["level"]
+
     if level == "YELLOW":
-        emoji, status = "🟡", "已恢復站立"
+        emoji = "🟡"
+        status = "已恢復站立"
+
     elif level == "ORANGE":
-        emoji, status = "🟠", "掙扎中"
+        emoji = "🟠"
+        status = "掙扎中"
+
     elif level == "RED":
-        emoji, status = "🔴", "可能無法起身"
+        emoji = "🔴"
+        status = "可能無法起身"
+
     else:
-        emoji, status = "⚪", "未知"
-        
-    device = conn.execute("SELECT alias FROM devices WHERE device_id=?", (device_id,)).fetchone()
+        emoji = "⚪"
+        status = "未知"
+
+    device = conn.execute(
+        "SELECT alias FROM devices WHERE device_id=?",
+        (device_id,)
+    ).fetchone()
+
     alias = device["alias"] if device and device["alias"] else device_id
-    msg = f"{emoji} 跌倒警示 {level}\n\n狀態: {status}\n設備: {alias} ({device_id})\ntime: {event_row['created_at']}\nbattery: {event_row['battery_v']}\nrssi: {event_row['rssi']}\nnote: {event_row['note']}"
+
+    msg = (
+        f"{emoji} 跌倒警示 {level}\n\n"
+        f"狀態: {status}\n"
+        f"設備: {alias} ({device_id})\n"
+        f"time: {event_row['created_at']}\n"
+        f"battery: {event_row['battery_v']}\n"
+        f"rssi: {event_row['rssi']}\n"
+        f"note: {event_row['note']}"
+    )
+
     targets = get_notify_targets(conn, device_id)
+
     for chat_id in targets:
         tg_send(chat_id, msg)
 
 # ----------------------
-# MODELS (保持不變)
+# MODELS
 # ----------------------
 
 class DeviceCreate(BaseModel):
@@ -146,100 +245,217 @@ class EventIn(BaseModel):
     rssi: Optional[int] = None
 
 # ----------------------
-# ADMIN API (保持不變)
+# ADMIN API
 # ----------------------
 
 @app.post("/admin/devices")
 def create_device(payload: DeviceCreate, x_admin_key: str = Header(default="")):
+
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=403)
+
     conn = db_conn()
-    conn.execute("INSERT INTO devices VALUES(?,?,?,?,?,?,?, ?,1)", (payload.device_id, payload.api_key, payload.alias, utc_now_iso(), None, None, None, None))
+
+    conn.execute(
+        "INSERT INTO devices VALUES(?,?,?,?,?,?,?, ?,1)",
+        (
+            payload.device_id,
+            payload.api_key,
+            payload.alias,
+            utc_now_iso(),
+            None,
+            None,
+            None,
+            None
+        )
+    )
+
     conn.commit()
     conn.close()
+
     return {"device_id": payload.device_id}
 
 @app.get("/admin/devices")
 def list_devices(x_admin_key: str = Header(default="")):
+
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=403)
+
     conn = db_conn()
-    rows = conn.execute("SELECT * FROM devices").fetchall()
+
+    rows = conn.execute(
+        "SELECT * FROM devices"
+    ).fetchall()
+
     conn.close()
+
     return [dict(r) for r in rows]
 
 @app.get("/admin/events")
 def list_events(x_admin_key: str = Header(default="")):
+
     if x_admin_key != ADMIN_KEY:
         raise HTTPException(status_code=403)
+
     conn = db_conn()
-    rows = conn.execute("SELECT * FROM events ORDER BY created_at DESC LIMIT 50").fetchall()
+
+    rows = conn.execute(
+        "SELECT * FROM events ORDER BY created_at DESC LIMIT 50"
+    ).fetchall()
+
     conn.close()
+
     return [dict(r) for r in rows]
 
 # ----------------------
-# DEVICE API (修改此處)
+# DEVICE API
 # ----------------------
 
 @app.post("/api/v1/events")
 def create_event(payload: EventIn, x_api_key: str = Header(default="")):
+
     conn = db_conn()
-    device = conn.execute("SELECT * FROM devices WHERE device_id=?", (payload.device_id,)).fetchone()
+
+    device = conn.execute(
+        "SELECT * FROM devices WHERE device_id=?",
+        (payload.device_id,)
+    ).fetchone()
+
     if not device:
         raise HTTPException(status_code=404)
+
     if device["api_key"] != x_api_key:
         raise HTTPException(status_code=403)
 
     event_id = str(uuid.uuid4())
+
     conn.execute(
         """INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (event_id, utc_now_iso(), payload.device_id, None, payload.level, None, None, None, payload.note, None, payload.battery_v, payload.rssi, 0, "PENDING", None)
+        (
+            event_id,
+            utc_now_iso(),
+            payload.device_id,
+            None,
+            payload.level,
+            None,
+            None,
+            None,
+            payload.note,
+            None,
+            payload.battery_v,
+            payload.rssi,
+            0,
+            "PENDING",
+            None
+        )
     )
+
     conn.commit()
-    event = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+
+    event = conn.execute(
+        "SELECT * FROM events WHERE event_id=?",
+        (event_id,)
+    ).fetchone()
+
+    # 原本的 Telegram 通知
     notify_event(conn, event)
 
-    # [新增 Email 功能] 拔除背景執行，改為直接呼叫，確保能看到 Log
+    # [新增 Email 功能] 針對嚴重等級觸發通報，並印出 Log 方便除錯
     print(f"🔍 檢查到的 Level 為: {payload.level}", flush=True)
     if payload.level in ["RED", "ORANGE"]:
         send_demo_email(payload.level, payload.note, payload.device_id)
 
     conn.close()
+
     return {"event_id": event_id}
 
 # ----------------------
-# TELEGRAM BOT (保持不變)
+# TELEGRAM BOT
 # ----------------------
 
 @app.post("/tg/webhook")
 def telegram_webhook(update: dict):
+
     if "message" not in update:
         return {"ok": True}
+
     msg = update["message"]
+
     chat_id = str(msg["chat"]["id"])
     text = msg.get("text", "").strip()
+
     conn = db_conn()
-    user = conn.execute("SELECT * FROM users WHERE telegram_id=?", (chat_id,)).fetchone()
+
+    user = conn.execute(
+        "SELECT * FROM users WHERE telegram_id=?",
+        (chat_id,)
+    ).fetchone()
+
     if not user:
+
         role = "admin" if chat_id in ADMIN_TELEGRAM_IDS else "user"
-        conn.execute("INSERT INTO users VALUES(?,?,?,?,?)", (chat_id, msg["from"].get("username"), role, "idle", utc_now_iso()))
+
+        conn.execute(
+            "INSERT INTO users VALUES(?,?,?,?,?)",
+            (chat_id, msg["from"].get("username"), role, "idle", utc_now_iso())
+        )
+
         conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE telegram_id=?", (chat_id,)).fetchone()
+
+        user = conn.execute(
+            "SELECT * FROM users WHERE telegram_id=?",
+            (chat_id,)
+        ).fetchone()
+
     if text == "/start":
-        tg_send(chat_id, "智能拐杖系統\n\n/pair 配對拐杖\n/mydevices 查看我的拐杖\n/unbind cane-001 解除配對")
+
+        tg_send(chat_id,
+        "智能拐杖系統\n\n"
+        "/pair 配對拐杖\n"
+        "/mydevices 查看我的拐杖\n"
+        "/unbind cane-001 解除配對"
+        )
+
     elif text == "/pair":
+
         tg_send(chat_id, "請輸入拐杖序號 (例如 cane-001)")
-        conn.execute("UPDATE users SET state='waiting_cane' WHERE telegram_id=?", (chat_id,))
+
+        conn.execute(
+            "UPDATE users SET state='waiting_cane' WHERE telegram_id=?",
+            (chat_id,)
+        )
+
         conn.commit()
+
     elif user["state"] == "waiting_cane":
+
         device_id = text
-        device = conn.execute("SELECT * FROM devices WHERE device_id=?", (device_id,)).fetchone()
+
+        device = conn.execute(
+            "SELECT * FROM devices WHERE device_id=?",
+            (device_id,)
+        ).fetchone()
+
         if not device:
+
             tg_send(chat_id, "找不到此拐杖")
+
         else:
-            conn.execute("INSERT OR IGNORE INTO user_devices VALUES(?,?,?)", (chat_id, device_id, utc_now_iso()))
-            conn.execute("UPDATE users SET state='idle' WHERE telegram_id=?", (chat_id,))
+
+            conn.execute(
+                "INSERT OR IGNORE INTO user_devices VALUES(?,?,?)",
+                (chat_id, device_id, utc_now_iso())
+            )
+
+            conn.execute(
+                "UPDATE users SET state='idle' WHERE telegram_id=?",
+                (chat_id,)
+            )
+
             conn.commit()
+
             tg_send(chat_id, f"已配對 {device_id}")
+
     conn.close()
+
     return {"ok": True}
