@@ -21,14 +21,10 @@ ADMIN_TELEGRAM_IDS = [x.strip() for x in ADMIN_TELEGRAM_IDS.split(",") if x.stri
 
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
-# ----------------------
-# [修改 Email 功能] 改用 Google Apps Script 中繼站
-# ----------------------
 GAS_EMAIL_URL = "https://script.google.com/macros/s/AKfycbw4RQkzHVSGeAWsBar0xyB_Uv8wihlN-BCX3y_IzZoKspPMBu8hC9DautElY5MXkuR1/exec"
 
 
 def send_demo_email(level: str, note: str, device_id: str):
-    """直接執行：透過 GAS 中繼站發送緊急通報郵件"""
     print("⏳ 準備透過 GAS 發送 Email...", flush=True)
 
     payload = {
@@ -50,18 +46,14 @@ def send_demo_email(level: str, note: str, device_id: str):
 
 app = FastAPI(title=APP_NAME)
 
-# 允許前端網頁跨網域呼叫
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 正式上線後建議改成你的前端網址
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------
-# UTILS
-# ----------------------
 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -72,10 +64,6 @@ def db_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
-
-# ----------------------
-# DB INIT
-# ----------------------
 
 def init_db():
     conn = db_conn()
@@ -142,20 +130,19 @@ def startup():
     init_db()
 
 
-# ----------------------
-# TELEGRAM
-# ----------------------
-
 def tg_send(chat_id, text):
     if not TG_BOT_TOKEN:
         return
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
 
-    requests.post(url, json={
-        "chat_id": chat_id,
-        "text": text
-    })
+    try:
+        requests.post(url, json={
+            "chat_id": chat_id,
+            "text": text
+        }, timeout=10)
+    except Exception as e:
+        print(f"❌ Telegram 發送失敗: {e}", flush=True)
 
 
 def get_notify_targets(conn, device_id):
@@ -177,10 +164,6 @@ def get_notify_targets(conn, device_id):
 
     return list(targets)
 
-
-# ----------------------
-# 通知
-# ----------------------
 
 def notify_event(conn, event_row):
     device_id = event_row["device_id"]
@@ -222,10 +205,6 @@ def notify_event(conn, event_row):
         tg_send(chat_id, msg)
 
 
-# ----------------------
-# MODELS
-# ----------------------
-
 class DeviceCreate(BaseModel):
     device_id: str
     api_key: str
@@ -240,10 +219,6 @@ class EventIn(BaseModel):
     rssi: Optional[int] = None
 
 
-# ----------------------
-# ROOT
-# ----------------------
-
 @app.get("/")
 def root():
     return {
@@ -252,47 +227,38 @@ def root():
     }
 
 
-# ----------------------
-# WEB DASHBOARD API
-# ----------------------
-
 @app.get("/api/dashboard")
 def get_dashboard():
     conn = db_conn()
 
     try:
-        # 最後一次真正警報事件（只算 ORANGE/RED）
         last_event = conn.execute("""
             SELECT event_id, created_at, device_id, level, note, battery_v, rssi, notify_status
             FROM events
-            WHERE level IN ('ORANGE', 'RED')
+            WHERE level IN ('YELLOW', 'ORANGE', 'RED')
             ORDER BY created_at DESC
             LIMIT 1
         """).fetchone()
 
-        # 今日跌倒次數（只算 ORANGE/RED）
         today_count = conn.execute("""
             SELECT COUNT(*) AS count
             FROM events
-            WHERE level IN ('ORANGE', 'RED')
+            WHERE level IN ('YELLOW', 'ORANGE', 'RED')
               AND date(created_at, 'localtime') = date('now', 'localtime')
         """).fetchone()["count"]
 
-        # 最近 10 筆真正警報事件
         recent_rows = conn.execute("""
             SELECT event_id, created_at, device_id, level, note, battery_v, rssi, notify_status
             FROM events
-            WHERE level IN ('ORANGE', 'RED')
+            WHERE level IN ('YELLOW', 'ORANGE', 'RED')
             ORDER BY created_at DESC
             LIMIT 10
         """).fetchall()
 
-        recent_events = [dict(row) for row in recent_rows]
-
         return {
             "today_count": today_count,
             "last_event": dict(last_event) if last_event else None,
-            "recent_events": recent_events
+            "recent_events": [dict(row) for row in recent_rows]
         }
 
     finally:
@@ -309,7 +275,7 @@ def get_recent_events(limit: int = 20):
         rows = conn.execute("""
             SELECT event_id, created_at, device_id, level, note, battery_v, rssi, notify_status
             FROM events
-            WHERE level IN ('ORANGE', 'RED')
+            WHERE level IN ('YELLOW', 'ORANGE', 'RED')
             ORDER BY created_at DESC
             LIMIT ?
         """, (limit,)).fetchall()
@@ -328,7 +294,7 @@ def get_today_stats():
         rows = conn.execute("""
             SELECT level, COUNT(*) AS count
             FROM events
-            WHERE level IN ('ORANGE', 'RED')
+            WHERE level IN ('YELLOW', 'ORANGE', 'RED')
               AND date(created_at, 'localtime') = date('now', 'localtime')
             GROUP BY level
             ORDER BY level
@@ -347,10 +313,6 @@ def get_today_stats():
         conn.close()
 
 
-# ----------------------
-# ADMIN API
-# ----------------------
-
 @app.post("/admin/devices")
 def create_device(payload: DeviceCreate, x_admin_key: str = Header(default="")):
     if x_admin_key != ADMIN_KEY:
@@ -358,24 +320,27 @@ def create_device(payload: DeviceCreate, x_admin_key: str = Header(default="")):
 
     conn = db_conn()
 
-    conn.execute(
-        "INSERT INTO devices VALUES(?,?,?,?,?,?,?, ?,1)",
-        (
-            payload.device_id,
-            payload.api_key,
-            payload.alias,
-            utc_now_iso(),
-            None,
-            None,
-            None,
-            None
+    try:
+        conn.execute(
+            "INSERT INTO devices VALUES(?,?,?,?,?,?,?, ?,1)",
+            (
+                payload.device_id,
+                payload.api_key,
+                payload.alias,
+                utc_now_iso(),
+                None,
+                None,
+                None,
+                None
+            )
         )
-    )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
-    return {"device_id": payload.device_id}
+        return {"device_id": payload.device_id}
+
+    finally:
+        conn.close()
 
 
 @app.get("/admin/devices")
@@ -385,13 +350,15 @@ def list_devices(x_admin_key: str = Header(default="")):
 
     conn = db_conn()
 
-    rows = conn.execute(
-        "SELECT * FROM devices"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM devices"
+        ).fetchall()
 
-    conn.close()
+        return [dict(r) for r in rows]
 
-    return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 @app.get("/admin/events")
@@ -401,18 +368,16 @@ def list_events(x_admin_key: str = Header(default="")):
 
     conn = db_conn()
 
-    rows = conn.execute(
-        "SELECT * FROM events ORDER BY created_at DESC LIMIT 50"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM events ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
 
-    conn.close()
+        return [dict(r) for r in rows]
 
-    return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
-
-# ----------------------
-# DEVICE API
-# ----------------------
 
 @app.post("/api/v1/events")
 def create_event(payload: EventIn, x_api_key: str = Header(default="")):
@@ -430,6 +395,11 @@ def create_event(payload: EventIn, x_api_key: str = Header(default="")):
         if device["api_key"] != x_api_key:
             raise HTTPException(status_code=403, detail="Invalid API key")
 
+        level = payload.level.upper().strip()
+
+        if level not in ["YELLOW", "ORANGE", "RED"]:
+            raise HTTPException(status_code=400, detail="Invalid level")
+
         event_id = str(uuid.uuid4())
 
         conn.execute(
@@ -439,7 +409,7 @@ def create_event(payload: EventIn, x_api_key: str = Header(default="")):
                 utc_now_iso(),
                 payload.device_id,
                 None,
-                payload.level,
+                level,
                 None,
                 None,
                 None,
@@ -460,23 +430,23 @@ def create_event(payload: EventIn, x_api_key: str = Header(default="")):
             (event_id,)
         ).fetchone()
 
-        # Telegram 通知
-        notify_event(conn, event)
+        print(f"🔍 檢查到的 Level 為: {level}", flush=True)
 
-        # 嚴重等級寄送 Email
-        print(f"🔍 檢查到的 Level 為: {payload.level}", flush=True)
-        if payload.level in ["RED", "ORANGE"]:
-            send_demo_email(payload.level, payload.note, payload.device_id)
+        if level in ["RED", "ORANGE"]:
+            notify_event(conn, event)
+            send_demo_email(level, payload.note, payload.device_id)
+        else:
+            print("🟡 YELLOW 事件已紀錄，不發送 Telegram / Email 通知", flush=True)
 
-        return {"event_id": event_id}
+        return {
+            "event_id": event_id,
+            "level": level,
+            "notified": level in ["RED", "ORANGE"]
+        }
 
     finally:
         conn.close()
 
-
-# ----------------------
-# TELEGRAM BOT
-# ----------------------
 
 @app.post("/tg/webhook")
 def telegram_webhook(update: dict):
